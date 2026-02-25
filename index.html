@@ -122,7 +122,7 @@
   // =====================
   // タイル種
   const TT = { GRASS:0, ROAD:1, WATER:2, WALL:3 };
-  const WALKABLE = new Set([TT.GRASS, TT.ROAD]);
+  const WALKABLE = new Set([TT.GRASS, TT.ROAD, TT.WATER]); // とりあえず水も歩ける
 
   // チャンクキー
   const keyOf = (cx,cy) => `${cx},${cy}`;
