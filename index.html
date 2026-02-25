@@ -1,1 +1,985 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>デカブサ放置冒険（MVP骨格）</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f14;color:#e9eef6;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #topbar{display:flex;gap:8px;align-items:center;padding:10px 12px;background:#07090c;border-bottom:1px solid rgba(255,255,255,.12)}
+  select,input{background:#0f1520;color:#e9eef6;border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:6px 8px}
+  #game{display:block;width:100%;height:100%;touch-action:none}
+  #hud{position:fixed;left:10px;bottom:10px;right:10px;pointer-events:none}
+  #log{pointer-events:none;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.35}
+  .muted{opacity:.7;font-size:12px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="topbar">
+    <label>作戦:
+      <select id="strategy">
+        <option value="balance">バランス</option>
+        <option value="fight">戦う優先</option>
+        <option value="flee">逃げる優先</option>
+        <option value="loot">回収優先</option>
+      </select>
+    </label>
+    <label>武器:
+      <select id="weapon">
+        <option value="melee">近接</option>
+        <option value="ranged">遠距離</option>
+        <option value="shield">盾</option>
+      </select>
+    </label>
+    <label>勇敢さ:
+      <input id="bravery" type="range" min="0" max="1" step="0.01" value="0.55" />
+    </label>
+    <span class="muted">タップ: 敵/宝箱/仲間/地面の順で優先</span>
+  </div>
+  <canvas id="game"></canvas>
+</div>
 
+<div id="hud">
+  <div id="log">ログ: 起動</div>
+</div>
+
+<script>
+(() => {
+  // =====================
+  // Config
+  // =====================
+  const TILE = 24;             // タイルサイズ（px）
+  const CHUNK = 64;            // 1チャンクのタイル数（64x64）
+  const VIEW_CHUNKS = 1;       // 周囲何チャンク分保持するか（1なら3x3）
+  const W = () => canvas.width;
+  const H = () => canvas.height;
+
+  // 色（フラット簡略）
+  const COLORS = {
+    grass: "#2b5d3a",
+    road:  "#3f4d55",
+    water: "#1f4f8a",
+    wall:  "#1a1c22",
+    // entities
+    enemy: "#ff4d6d",
+    ally:  "#49b6ff",
+    chest: "#ffd166",
+    node:  "rgba(255,255,255,.12)",
+    target:"#9cf1ff",
+    dekabusa:"#d6d7d9",
+    outline:"#101218",
+    hp:"#52f3a0",
+    dmg:"#ff4d6d",
+  };
+
+  // =====================
+  // Canvas / Resize
+  // =====================
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  function resize(){
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor((window.innerHeight - document.getElementById("topbar").offsetHeight) * dpr);
+    canvas.style.height = (window.innerHeight - document.getElementById("topbar").offsetHeight) + "px";
+    canvas.style.width = window.innerWidth + "px";
+    ctx.setTransform(dpr,0,0,dpr,0,0); // 描画座標をCSS px基準に
+  }
+  window.addEventListener("resize", resize, {passive:true});
+  resize();
+
+  // =====================
+  // UI state
+  // =====================
+  const ui = {
+    get strategy(){ return document.getElementById("strategy").value; },
+    get weapon(){ return document.getElementById("weapon").value; },
+    get bravery(){ return parseFloat(document.getElementById("bravery").value); },
+    logEl: document.getElementById("log"),
+    log(msg){
+      ui.logEl.textContent = "ログ: " + msg;
+    }
+  };
+
+  // =====================
+  // RNG (seedable-ish)
+  // =====================
+  let seed = (Date.now() >>> 0);
+  function rand(){
+    // xorshift32
+    seed ^= seed << 13; seed >>>= 0;
+    seed ^= seed >> 17; seed >>>= 0;
+    seed ^= seed << 5;  seed >>>= 0;
+    return (seed >>> 0) / 4294967296;
+  }
+  function randi(n){ return Math.floor(rand()*n); }
+
+  // =====================
+  // World / Chunks
+  // =====================
+  // タイル種
+  const TT = { GRASS:0, ROAD:1, WATER:2, WALL:3 };
+  const WALKABLE = new Set([TT.GRASS, TT.ROAD]);
+
+  // チャンクキー
+  const keyOf = (cx,cy) => `${cx},${cy}`;
+
+  // チャンク保存
+  const chunks = new Map(); // key -> {cx,cy,tiles,entitiesSpawned}
+  function getChunk(cx,cy){
+    const k = keyOf(cx,cy);
+    if(chunks.has(k)) return chunks.get(k);
+    const ch = genChunk(cx,cy);
+    chunks.set(k, ch);
+    return ch;
+  }
+
+  function genChunk(cx,cy){
+    // tiles: Uint8Array (CHUNK*CHUNK)
+    const tiles = new Uint8Array(CHUNK*CHUNK);
+    // 簡易: 草ベース、たまに水・壁・道
+    for(let y=0;y<CHUNK;y++){
+      for(let x=0;x<CHUNK;x++){
+        let t = TT.GRASS;
+        const nx = (cx*CHUNK + x);
+        const ny = (cy*CHUNK + y);
+
+        // 道: ざっくり縦横に走らせる
+        if((nx % 23)===0 || (ny % 29)===0) t = TT.ROAD;
+
+        // 水: ノイズ風
+        const w = (Math.sin(nx*0.17)+Math.cos(ny*0.13)+Math.sin((nx+ny)*0.07));
+        if(w > 2.1) t = TT.WATER;
+
+        // 壁: 水の縁やランダム
+        if(t===TT.GRASS && w < -2.35) t = TT.WALL;
+
+        tiles[y*CHUNK+x]=t;
+      }
+    }
+
+    return { cx, cy, tiles, spawned:false };
+  }
+
+  function tileAt(tx,ty){
+    const cx = Math.floor(tx/CHUNK);
+    const cy = Math.floor(ty/CHUNK);
+    const ch = getChunk(cx,cy);
+    const lx = tx - cx*CHUNK;
+    const ly = ty - cy*CHUNK;
+    if(lx<0||ly<0||lx>=CHUNK||ly>=CHUNK) return TT.WALL;
+    return ch.tiles[ly*CHUNK+lx];
+  }
+
+  function isWalkable(tx,ty){
+    return WALKABLE.has(tileAt(tx,ty));
+  }
+
+  // =====================
+  // Entities
+  // =====================
+  let nextId = 1;
+  const entities = new Map(); // id -> ent
+
+  function addEntity(ent){
+    ent.id = nextId++;
+    entities.set(ent.id, ent);
+    return ent.id;
+  }
+  function removeEntity(id){ entities.delete(id); }
+
+  // 簡単な距離
+  const dist = (ax,ay,bx,by) => Math.hypot(ax-bx, ay-by);
+
+  // =====================
+  // Player (Dekabusa)
+  // =====================
+  const player = {
+    x: 10*TILE, y: 10*TILE, // world px
+    r: 9, // hit radius px
+    speed: 72, // px/s
+    hp: 100, hpMax: 100,
+
+    state: "WANDER",
+    target: null, // {type, id?, x?, y?}
+    path: [], // array of world points {x,y}
+    repathTimer: 0,
+
+    // combat
+    atkCooldown: 0,
+    atkRange: 18, // px
+  };
+
+  // 仲間（隊列）
+  const party = []; // ent ids
+
+  function myPower(){
+    const weapon = ui.weapon;
+    const gear = (weapon==="shield") ? 1 : 2;
+    return gear + party.length * 0.5;
+  }
+
+  // =====================
+  // Spawning in loaded area
+  // =====================
+  function ensureSpawnsAroundPlayer(){
+    const ptx = Math.floor(player.x / TILE);
+    const pty = Math.floor(player.y / TILE);
+    const pcx = Math.floor(ptx/CHUNK);
+    const pcy = Math.floor(pty/CHUNK);
+
+    for(let dy=-VIEW_CHUNKS; dy<=VIEW_CHUNKS; dy++){
+      for(let dx=-VIEW_CHUNKS; dx<=VIEW_CHUNKS; dx++){
+        const cx = pcx+dx, cy = pcy+dy;
+        const ch = getChunk(cx,cy);
+        if(ch.spawned) continue;
+        ch.spawned = true;
+        spawnInChunk(ch);
+      }
+    }
+
+    // 古いチャンク掃除（任意: ここは軽くするため小さめ）
+    for(const [k,ch] of chunks){
+      const far = Math.max(Math.abs(ch.cx-pcx), Math.abs(ch.cy-pcy));
+      if(far > VIEW_CHUNKS+2){
+        // チャンク削除（エンティティは残るけど、MVPは気にしない）
+        chunks.delete(k);
+      }
+    }
+  }
+
+  function randomWalkableInChunk(ch){
+    for(let tries=0; tries<200; tries++){
+      const lx = randi(CHUNK), ly = randi(CHUNK);
+      const tx = ch.cx*CHUNK + lx;
+      const ty = ch.cy*CHUNK + ly;
+      if(isWalkable(tx,ty)){
+        return { x: (tx+0.5)*TILE, y: (ty+0.5)*TILE };
+      }
+    }
+    return null;
+  }
+
+  function spawnInChunk(ch){
+    // 敵: 3〜6
+    const enemyN = 3 + randi(4);
+    for(let i=0;i<enemyN;i++){
+      const p = randomWalkableInChunk(ch);
+      if(!p) continue;
+      addEntity({
+        kind:"enemy",
+        x:p.x, y:p.y,
+        r:8,
+        hp: 20 + randi(30),
+        power: 1 + randi(5),
+        speed: 40 + randi(25),
+        vx:0, vy:0,
+        wanderT: rand()*2,
+      });
+    }
+    // 宝箱: 1〜2
+    const chestN = 1 + randi(2);
+    for(let i=0;i<chestN;i++){
+      const p = randomWalkableInChunk(ch);
+      if(!p) continue;
+      addEntity({ kind:"chest", x:p.x, y:p.y, r:9 });
+    }
+    // 仲間候補: 0〜1
+    if(rand()<0.6){
+      const p = randomWalkableInChunk(ch);
+      if(p){
+        addEntity({ kind:"allyCandidate", x:p.x, y:p.y, r:8, speed:45, wanderT: rand()*2 });
+      }
+    }
+  }
+
+  // =====================
+  // Camera
+  // =====================
+  const cam = { x:0, y:0 };
+  function updateCamera(){
+    cam.x = player.x - (window.innerWidth/2);
+    cam.y = player.y - ((window.innerHeight - document.getElementById("topbar").offsetHeight)/2);
+  }
+
+  // =====================
+  // A* Pathfinding (tile-based)
+  // =====================
+  function toTile(px){ return Math.floor(px / TILE); }
+  function tileCenter(tx,ty){ return {x:(tx+0.5)*TILE, y:(ty+0.5)*TILE}; }
+
+  function astar(startTx,startTy, goalTx,goalTy, maxNodes=3500){
+    // 4方向
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+
+    const startK = keyOf(startTx,startTy);
+    const goalK  = keyOf(goalTx,goalTy);
+
+    const open = new Map(); // k -> node
+    const openArr = []; // priority queue簡易（小規模なので配列でOK）
+    const closed = new Set();
+
+    function h(tx,ty){ return Math.abs(tx-goalTx)+Math.abs(ty-goalTy); }
+
+    const start = {tx:startTx, ty:startTy, g:0, f:h(startTx,startTy), parent:null};
+    open.set(startK, start);
+    openArr.push(start);
+
+    let nodes = 0;
+
+    while(openArr.length && nodes < maxNodes){
+      // f最小を探す
+      let bestIdx = 0;
+      for(let i=1;i<openArr.length;i++){
+        if(openArr[i].f < openArr[bestIdx].f) bestIdx = i;
+      }
+      const cur = openArr.splice(bestIdx,1)[0];
+      const ck = keyOf(cur.tx,cur.ty);
+      open.delete(ck);
+      if(ck === goalK){
+        // 復元
+        const path = [];
+        let n = cur;
+        while(n){
+          path.push({tx:n.tx, ty:n.ty});
+          n = n.parent;
+        }
+        path.reverse();
+        return path;
+      }
+      closed.add(ck);
+      nodes++;
+
+      for(const [dx,dy] of dirs){
+        const nx = cur.tx+dx, ny = cur.ty+dy;
+        const nk = keyOf(nx,ny);
+        if(closed.has(nk)) continue;
+        if(!isWalkable(nx,ny)) continue;
+
+        const ng = cur.g + 1;
+        const nf = ng + h(nx,ny);
+
+        const existing = open.get(nk);
+        if(!existing || ng < existing.g){
+          const node = {tx:nx, ty:ny, g:ng, f:nf, parent:cur};
+          open.set(nk,node);
+          if(!existing) openArr.push(node);
+          else {
+            // 既存を更新（配列内は参照なのでOK）
+            existing.g = ng; existing.f = nf; existing.parent = cur; existing.tx=nx; existing.ty=ny;
+          }
+        }
+      }
+    }
+    return null; // 失敗
+  }
+
+  function buildPathTo(worldX, worldY){
+    const sx = toTile(player.x), sy = toTile(player.y);
+    const gx = toTile(worldX), gy = toTile(worldY);
+    if(!isWalkable(gx,gy)) return false;
+
+    const tilePath = astar(sx,sy,gx,gy);
+    if(!tilePath || tilePath.length<2) return false;
+
+    // タイル中心のworld座標へ
+    player.path = tilePath.slice(1).map(p => tileCenter(p.tx,p.ty));
+    return true;
+  }
+
+  // =====================
+  // Target selection (tap priority)
+  // =====================
+  const tap = { ring:null }; // {x,y,t:0}
+  function worldFromScreen(sx,sy){
+    return { x: sx + cam.x, y: sy + cam.y };
+  }
+
+  function pickEntityAt(wx,wy){
+    // 近い順に1つ、かつ kind優先
+    // 優先: enemy > chest > allyCandidate
+    const candidates = [];
+    for(const ent of entities.values()){
+      if(ent.kind!=="enemy" && ent.kind!=="chest" && ent.kind!=="allyCandidate") continue;
+      const d = dist(wx,wy, ent.x,ent.y);
+      if(d <= ent.r + 10) candidates.push({ent, d});
+    }
+    if(!candidates.length) return null;
+
+    candidates.sort((a,b)=>a.d-b.d);
+    // kind優先
+    const rank = (k)=> (k==="enemy"?0 : k==="chest"?1 : 2);
+    candidates.sort((a,b)=> rank(a.ent.kind)-rank(b.ent.kind) || a.d-b.d);
+    return candidates[0].ent;
+  }
+
+  function setTargetFromTap(wx,wy){
+    const ent = pickEntityAt(wx,wy);
+    if(ent){
+      if(ent.kind==="enemy"){
+        player.target = { type:"ATTACK", id: ent.id };
+        ui.log("敵を狙う");
+      }else if(ent.kind==="chest"){
+        player.target = { type:"LOOT", id: ent.id };
+        ui.log("宝箱へ");
+      }else if(ent.kind==="allyCandidate"){
+        player.target = { type:"TALK", id: ent.id };
+        ui.log("仲間候補へ");
+      }
+    }else{
+      player.target = { type:"MOVE", x: wx, y: wy };
+      ui.log("呼び寄せ");
+    }
+    player.state = "FOLLOW_TARGET";
+    player.repathTimer = 0; // 即リパス
+    tap.ring = {x:wx,y:wy,t:0};
+  }
+
+  function pointerToCanvas(e){
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left);
+    const y = (e.clientY - rect.top);
+    return {x,y};
+  }
+
+  canvas.addEventListener("pointerdown", (e)=>{
+    e.preventDefault();
+    const p = pointerToCanvas(e);
+    const w = worldFromScreen(p.x, p.y);
+    setTargetFromTap(w.x, w.y);
+  }, {passive:false});
+
+  // =====================
+  // Enemy / AllyCandidate simple wandering
+  // =====================
+  function entityWander(ent, dt){
+    ent.wanderT -= dt;
+    if(ent.wanderT <= 0){
+      ent.wanderT = 1.5 + rand()*2.5;
+      const ang = rand()*Math.PI*2;
+      ent.vx = Math.cos(ang) * ent.speed;
+      ent.vy = Math.sin(ang) * ent.speed;
+    }
+    // 移動（壁は反射）
+    const nx = ent.x + ent.vx*dt;
+    const ny = ent.y + ent.vy*dt;
+    const ntx = toTile(nx), nty = toTile(ny);
+    if(isWalkable(ntx,nty)){
+      ent.x = nx; ent.y = ny;
+    }else{
+      ent.vx *= -0.6; ent.vy *= -0.6;
+      ent.wanderT = 0.2;
+    }
+  }
+
+  // =====================
+  // Combat
+  // =====================
+  function weaponProps(){
+    const w = ui.weapon;
+    if(w==="melee")  return {range:18, damage: 10, kite:false, dmgTakenMul:1.0};
+    if(w==="ranged") return {range:72, damage: 7,  kite:true,  dmgTakenMul:1.0};
+    return              {range:18, damage: 6,  kite:false, dmgTakenMul:0.65}; // shield
+  }
+
+  function attackEnemy(enemy){
+    const wp = weaponProps();
+    if(player.atkCooldown > 0) return false;
+    enemy.hp -= wp.damage;
+    player.atkCooldown = 0.4;
+    if(enemy.hp <= 0){
+      removeEntity(enemy.id);
+      ui.log("敵を倒した");
+      // たまに宝箱スポーン（気持ちよさ）
+      if(rand()<0.25){
+        addEntity({kind:"chest", x: enemy.x, y: enemy.y, r:9});
+        ui.log("宝箱が落ちた");
+      }
+      return true;
+    }
+    return true;
+  }
+
+  // =====================
+  // Utility AI
+  // =====================
+  function strategyBonuses(){
+    const s = ui.strategy;
+    return {
+      fight: (s==="fight") ? 60 : (s==="flee") ? -20 : 0,
+      flee:  (s==="flee") ? 70 : (s==="fight") ? -10 : 0,
+      loot:  (s==="loot") ? 60 : 0,
+    };
+  }
+
+  function nearest(kind){
+    let best=null, bd=Infinity;
+    for(const ent of entities.values()){
+      if(ent.kind!==kind) continue;
+      const d = dist(player.x,player.y, ent.x,ent.y);
+      if(d<bd){ bd=d; best=ent; }
+    }
+    return best ? {ent:best, d:bd} : null;
+  }
+
+  function chooseState(){
+    if(player.target) return "FOLLOW_TARGET";
+
+    const b = ui.bravery;
+    const bonus = strategyBonuses();
+    const hpPct = player.hp / player.hpMax;
+
+    // 近い敵/宝箱
+    const ne = nearest("enemy");
+    const nc = nearest("chest");
+
+    // 危険判定
+    let dangerScore = 0;
+    let fightScore = 0;
+    let lootScore = 0;
+    let restScore = 0;
+
+    if(hpPct < 0.30) restScore = 300;
+
+    if(ne){
+      const enemy = ne.ent;
+      const myP = myPower();
+      const enemyP = enemy.power;
+      const close = ne.d < 120;
+
+      const canWin = (myP >= enemyP);
+      const veryDanger = (enemyP >= myP + 1);
+
+      if(close && veryDanger){
+        dangerScore = 200 + (1-b)*80 + bonus.flee;
+      }
+      if(close && canWin){
+        fightScore = 160 + b*60 + bonus.fight;
+      }
+      // 遠距離ならちょっと遠くても攻撃候補
+      if(ui.weapon==="ranged" && ne.d < 220 && canWin){
+        fightScore = Math.max(fightScore, 145 + b*55 + bonus.fight);
+      }
+    }
+
+    if(nc && nc.d < 220){
+      lootScore = 120 + bonus.loot;
+    }
+
+    // 常に探索
+    const wanderScore = 30;
+
+    // 最大を選ぶ
+    let best = {st:"WANDER", sc:wanderScore};
+    const cand = [
+      {st:"REST", sc:restScore},
+      {st:"FLEE", sc:dangerScore},
+      {st:"FIGHT", sc:fightScore},
+      {st:"LOOT", sc:lootScore},
+      {st:"WANDER", sc:wanderScore},
+    ];
+    for(const c of cand){
+      if(c.sc > best.sc) best = c;
+    }
+    return best.st;
+  }
+
+  // =====================
+  // Player steering / movement along path
+  // =====================
+  function stepAlongPath(dt){
+    if(!player.path.length) return false;
+    const next = player.path[0];
+    const dx = next.x - player.x;
+    const dy = next.y - player.y;
+    const d = Math.hypot(dx,dy);
+    const v = player.speed;
+    if(d < 2){
+      player.path.shift();
+      return true;
+    }
+    const nx = player.x + (dx/d)*v*dt;
+    const ny = player.y + (dy/d)*v*dt;
+    // 最低限の衝突（歩けないタイルに入らない）
+    const ntx = toTile(nx), nty = toTile(ny);
+    if(isWalkable(ntx,nty)){
+      player.x = nx; player.y = ny;
+    }else{
+      player.path = [];
+    }
+    return true;
+  }
+
+  function setAutoTargetFromState(){
+    if(player.state==="FIGHT"){
+      const ne = nearest("enemy");
+      if(ne) player.target = {type:"ATTACK", id: ne.ent.id};
+    } else if(player.state==="LOOT"){
+      const nc = nearest("chest");
+      if(nc) player.target = {type:"LOOT", id: nc.ent.id};
+    } else if(player.state==="FLEE"){
+      // 逃げ先: 近い敵から反対方向へ少し
+      const ne = nearest("enemy");
+      if(ne){
+        const ex = ne.ent.x, ey = ne.ent.y;
+        const dx = player.x - ex, dy = player.y - ey;
+        const d = Math.hypot(dx,dy) || 1;
+        const tx = player.x + (dx/d) * 220;
+        const ty = player.y + (dy/d) * 220;
+        player.target = {type:"MOVE", x: tx, y: ty};
+      }
+    } else if(player.state==="REST"){
+      // その場
+      player.target = null;
+      player.path = [];
+    } else if(player.state==="WANDER"){
+      // 目的地ランダム
+      const tries = 80;
+      for(let i=0;i<tries;i++){
+        const tx = toTile(player.x) + (randi(21)-10);
+        const ty = toTile(player.y) + (randi(21)-10);
+        if(isWalkable(tx,ty)){
+          const p = tileCenter(tx,ty);
+          player.target = {type:"MOVE", x:p.x, y:p.y};
+          return;
+        }
+      }
+    }
+  }
+
+  function resolveTargetWorldPos(){
+    if(!player.target) return null;
+    if(player.target.type==="MOVE") return {x:player.target.x, y:player.target.y};
+
+    const ent = entities.get(player.target.id);
+    if(!ent) return null;
+
+    if(player.target.type==="ATTACK"){
+      // 敵の近く（射程内に入るように）
+      return {x:ent.x, y:ent.y};
+    }
+    if(player.target.type==="LOOT"){
+      return {x:ent.x, y:ent.y};
+    }
+    if(player.target.type==="TALK"){
+      return {x:ent.x, y:ent.y};
+    }
+    return null;
+  }
+
+  // =====================
+  // Ally following (party)
+  // =====================
+  function updateParty(dt){
+    // とりあえず「隊列」っぽく後ろに追従
+    for(let i=0;i<party.length;i++){
+      const id = party[i];
+      const a = entities.get(id);
+      if(!a) continue;
+
+      const followDist = 28 + i*18;
+      // 目標: プレイヤーの少し後ろ（方向は簡易で固定）
+      const tx = player.x - followDist;
+      const ty = player.y + (i%2===0 ? followDist*0.25 : -followDist*0.25);
+      const dx = tx - a.x, dy = ty - a.y;
+      const d = Math.hypot(dx,dy);
+      const v = 64;
+      if(d > 4){
+        a.x += (dx/(d||1))*v*dt;
+        a.y += (dy/(d||1))*v*dt;
+      }
+    }
+  }
+
+  // =====================
+  // Main update
+  // =====================
+  let last = performance.now();
+
+  function update(dt){
+    ensureSpawnsAroundPlayer();
+
+    // entity wander
+    for(const ent of entities.values()){
+      if(ent.kind==="enemy" || ent.kind==="allyCandidate"){
+        entityWander(ent, dt);
+      }
+    }
+
+    // AI choose
+    if(!player.target){
+      player.state = chooseState();
+      setAutoTargetFromState();
+    }
+
+    // Rest
+    if(player.state==="REST"){
+      player.hp = Math.min(player.hpMax, player.hp + 18*dt);
+    }
+
+    // Target follow / repath
+    if(player.target){
+      player.repathTimer -= dt;
+      const pos = resolveTargetWorldPos();
+      if(!pos){
+        player.target = null;
+        player.path = [];
+      }else{
+        if(player.repathTimer <= 0 || player.path.length===0){
+          buildPathTo(pos.x, pos.y);
+          player.repathTimer = 0.45;
+        }
+        stepAlongPath(dt);
+      }
+    }
+
+    // Combat / Interactions when close
+    if(player.target){
+      const t = player.target;
+      const wp = weaponProps();
+
+      if(t.type==="ATTACK"){
+        const e = entities.get(t.id);
+        if(!e){ player.target=null; player.path=[]; }
+        else{
+          const d = dist(player.x,player.y,e.x,e.y);
+          // 遠距離 kite: 近すぎたら後退
+          if(ui.weapon==="ranged" && d < 42){
+            const dx = player.x - e.x, dy = player.y - e.y;
+            const k = Math.hypot(dx,dy) || 1;
+            player.x += (dx/k) * player.speed * dt;
+            player.y += (dy/k) * player.speed * dt;
+          }
+          if(d <= wp.range){
+            attackEnemy(e);
+          }
+          // enemy damages player when too close (MVP)
+          if(d <= 20){
+            const taken = (e.power * 4) * wp.dmgTakenMul * dt;
+            player.hp -= taken;
+            if(player.hp <= 0){
+              player.hp = 1;
+              ui.log("ゲームオーバー（仮）");
+              player.target = null;
+              player.path = [];
+            }
+          }
+        }
+      }
+
+      if(t.type==="LOOT"){
+        const c = entities.get(t.id);
+        if(!c){ player.target=null; player.path=[]; }
+        else{
+          const d = dist(player.x,player.y,c.x,c.y);
+          if(d <= 18){
+            removeEntity(c.id);
+            ui.log("宝箱を回収（+何か）");
+            player.target = null;
+            player.path = [];
+          }
+        }
+      }
+
+      if(t.type==="TALK"){
+        const n = entities.get(t.id);
+        if(!n){ player.target=null; player.path=[]; }
+        else{
+          const d = dist(player.x,player.y,n.x,n.y);
+          if(d <= 20){
+            // 加入抽選
+            if(rand() < 0.30){
+              // 仲間化: kindをallyにして隊列へ
+              n.kind = "ally";
+              party.push(n.id);
+              ui.log("仲間になった");
+            }else{
+              ui.log("……");
+              removeEntity(n.id);
+            }
+            player.target = null;
+            player.path = [];
+          }
+        }
+      }
+
+      if(t.type==="MOVE"){
+        const d = dist(player.x,player.y,t.x,t.y);
+        if(d <= 10){
+          player.target = null;
+          player.path = [];
+        }
+      }
+    }
+
+    // cooldown
+    player.atkCooldown = Math.max(0, player.atkCooldown - dt);
+
+    // party follow
+    updateParty(dt);
+
+    // tap ring anim
+    if(tap.ring){
+      tap.ring.t += dt;
+      if(tap.ring.t > 0.7) tap.ring = null;
+    }
+
+    updateCamera();
+  }
+
+  // =====================
+  // Draw
+  // =====================
+  function draw(){
+    // clear
+    ctx.clearRect(0,0,window.innerWidth,window.innerHeight);
+
+    // visible tile bounds in world tiles
+    const viewW = window.innerWidth;
+    const viewH = (window.innerHeight - document.getElementById("topbar").offsetHeight);
+
+    const left = Math.floor(cam.x / TILE) - 2;
+    const top  = Math.floor(cam.y / TILE) - 2;
+    const right = left + Math.ceil(viewW / TILE) + 4;
+    const bottom= top  + Math.ceil(viewH / TILE) + 4;
+
+    // tiles
+    for(let ty=top; ty<=bottom; ty++){
+      for(let tx=left; tx<=right; tx++){
+        const t = tileAt(tx,ty);
+        let col = COLORS.grass;
+        if(t===TT.ROAD) col = COLORS.road;
+        else if(t===TT.WATER) col = COLORS.water;
+        else if(t===TT.WALL) col = COLORS.wall;
+
+        const x = tx*TILE - cam.x;
+        const y = ty*TILE - cam.y;
+        ctx.fillStyle = col;
+        ctx.fillRect(x,y,TILE,TILE);
+      }
+    }
+
+    // target ring
+    if(tap.ring){
+      const x = tap.ring.x - cam.x;
+      const y = tap.ring.y - cam.y;
+      ctx.strokeStyle = COLORS.target;
+      ctx.lineWidth = 2;
+      const r = 10 + tap.ring.t*26;
+      ctx.globalAlpha = Math.max(0, 1 - tap.ring.t/0.7);
+      ctx.beginPath();
+      ctx.arc(x,y,r,0,Math.PI*2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // path nodes (optional debug)
+    if(player.path.length){
+      ctx.fillStyle = COLORS.node;
+      for(const p of player.path){
+        ctx.fillRect(p.x - cam.x - 2, p.y - cam.y - 2, 4, 4);
+      }
+    }
+
+    // entities
+    for(const ent of entities.values()){
+      const sx = ent.x - cam.x;
+      const sy = ent.y - cam.y;
+
+      if(ent.kind==="enemy"){
+        ctx.fillStyle = COLORS.enemy;
+        ctx.beginPath(); ctx.arc(sx,sy,ent.r,0,Math.PI*2); ctx.fill();
+      }else if(ent.kind==="chest"){
+        ctx.fillStyle = COLORS.chest;
+        ctx.fillRect(sx-ent.r, sy-ent.r, ent.r*2, ent.r*2);
+      }else if(ent.kind==="allyCandidate"){
+        ctx.fillStyle = COLORS.ally;
+        ctx.beginPath(); ctx.arc(sx,sy,ent.r,0,Math.PI*2); ctx.fill();
+        // 小さな点で「候補」感
+        ctx.fillStyle = "rgba(255,255,255,.55)";
+        ctx.fillRect(sx-1, sy-1, 2, 2);
+      }else if(ent.kind==="ally"){
+        ctx.fillStyle = COLORS.ally;
+        ctx.beginPath(); ctx.arc(sx,sy,ent.r,0,Math.PI*2); ctx.fill();
+      }
+    }
+
+    // player (デカブサ簡略)
+    drawDekabusa(player.x - cam.x, player.y - cam.y);
+
+    // HP bar
+    const hpw = 140, hph=10;
+    const px = 14, py = 14;
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.fillRect(px,py,hpw,hph);
+    ctx.fillStyle = COLORS.hp;
+    ctx.fillRect(px,py,hpw*(player.hp/player.hpMax),hph);
+    ctx.strokeStyle = "rgba(255,255,255,.18)";
+    ctx.strokeRect(px,py,hpw,hph);
+
+    // state text
+    ctx.fillStyle = "rgba(255,255,255,.8)";
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.fillText(`STATE: ${player.state}  party:${party.length}  power:${myPower().toFixed(1)}`, px, py+28);
+  }
+
+  function drawDekabusa(x,y){
+    // “フラット簡略”デカブサ（仮アイコン）
+    // 丸っこい胴体 + 半目 + 口線
+    ctx.save();
+    ctx.translate(x,y);
+
+    // body
+    ctx.fillStyle = COLORS.dekabusa;
+    ctx.strokeStyle = COLORS.outline;
+    ctx.lineWidth = 3;
+
+    // 体
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 14, 16, 0, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+
+    // 目（半目）
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-7,-6); ctx.lineTo(-2,-6);
+    ctx.moveTo( 2,-6); ctx.lineTo( 7,-6);
+    ctx.stroke();
+
+    // 口（水平ライン）
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-6, 4); ctx.lineTo(6, 4);
+    ctx.stroke();
+
+    // 腕だらん
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-12, 0); ctx.lineTo(-14, 10);
+    ctx.moveTo( 12, 0); ctx.lineTo( 14, 10);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // =====================
+  // Game loop
+  // =====================
+  function loop(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // 初期ログ
+  ui.log("タップで呼べる。敵/宝箱/仲間をタップすると優先。");
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
